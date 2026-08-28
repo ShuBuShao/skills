@@ -1,0 +1,4 @@
+interface:
+  display_name: "Multi-Repo Workspace"
+  short_description: "Clone coordinated repositories into one workspace"
+  default_prompt: "Use $multi-repo-workspace to create a coordinated multi-repository workspace."
