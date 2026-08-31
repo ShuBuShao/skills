@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import runpy
 import subprocess
 import sys
 import tempfile
@@ -67,6 +68,7 @@ class MultiRepoWorkspaceTest(unittest.TestCase):
         run(["git", "commit", "-m", "feature"], cwd=checkout)
         run(["git", "clone", "--bare", str(checkout), str(remote)])
         run(["git", "remote", "add", "origin", str(remote)], cwd=checkout)
+        run(["git", "switch", "main"], cwd=checkout)
 
         if with_manifest:
             (checkout / ".env.local").write_text("LOCAL_ONLY=yes\n", encoding="utf-8")
@@ -125,6 +127,14 @@ class MultiRepoWorkspaceTest(unittest.TestCase):
             "feature/shared",
         )
         self.assertEqual(
+            Path(
+                run(
+                    ["git", "rev-parse", "--git-common-dir"], cwd=workspace / "frontend"
+                ).stdout.strip()
+            ).resolve(),
+            (frontend_source / ".git").resolve(),
+        )
+        self.assertEqual(
             run(["git", "remote", "get-url", "origin"], cwd=workspace / "frontend").stdout.strip(),
             str(frontend_remote),
         )
@@ -144,7 +154,29 @@ class MultiRepoWorkspaceTest(unittest.TestCase):
             for repository in created_report["repositories"]
             if repository["name"] == "frontend"
         )
+        self.assertEqual(frontend_result["mode"], "worktree-existing-local-branch")
+        self.assertEqual(
+            created_report["linked_worktrees"],
+            [
+                {
+                    "name": "frontend",
+                    "backing_repo": str(frontend_source.resolve()),
+                    "path": str((workspace / "frontend").resolve()),
+                }
+            ],
+        )
+        backend_result = next(
+            repository
+            for repository in created_report["repositories"]
+            if repository["name"] == "backend"
+        )
+        self.assertEqual(backend_result["mode"], "clone-branch")
         self.assertIn("tracked.txt", frontend_result["hydration"]["skipped"]["paths"])
+        worktree_list = run(
+            ["git", "worktree", "list", "--porcelain"], cwd=frontend_source
+        ).stdout
+        self.assertIn(f"worktree {(workspace / 'frontend').resolve()}", worktree_list)
+        self.assertNotIn(".creating-", worktree_list)
         workspace_data = json.loads(
             (workspace / "feature-suite.code-workspace").read_text(encoding="utf-8")
         )
@@ -152,6 +184,127 @@ class MultiRepoWorkspaceTest(unittest.TestCase):
             [folder["name"] for folder in workspace_data["folders"]],
             ["frontend", "backend"],
         )
+
+    def test_fetches_remote_branch_into_local_repository_for_worktree(self) -> None:
+        source, _ = self.make_repository("service")
+        run(["git", "branch", "-D", "feature/shared"], cwd=source)
+        workspace = self.root / "workspace"
+        spec = self.write_spec(
+            {
+                "workspace": str(workspace),
+                "name": "remote-feature",
+                "branch": "feature/shared",
+                "primary": "service",
+                "repositories": [{"name": "service", "local_repo": str(source)}],
+            }
+        )
+
+        created, report = self.invoke("create", spec)
+        self.assertEqual(created.returncode, 0)
+        self.assertEqual(report["repositories"][0]["mode"], "worktree-track-remote-branch")
+        self.assertEqual(
+            run(
+                ["git", "rev-parse", "--abbrev-ref", "@{upstream}"],
+                cwd=workspace / "service",
+            ).stdout.strip(),
+            "origin/feature/shared",
+        )
+
+    def test_creates_worktree_branch_from_local_base(self) -> None:
+        source, _ = self.make_repository("service")
+        workspace = self.root / "workspace"
+        spec = self.write_spec(
+            {
+                "workspace": str(workspace),
+                "name": "local-base",
+                "branch": "feature/local-only",
+                "primary": "service",
+                "repositories": [
+                    {
+                        "name": "service",
+                        "local_repo": str(source),
+                        "base_branch": "main",
+                    }
+                ],
+            }
+        )
+
+        created, report = self.invoke("create", spec)
+        self.assertEqual(created.returncode, 0)
+        self.assertEqual(
+            report["repositories"][0]["mode"],
+            "worktree-create-local-branch-from-local-base",
+        )
+        self.assertEqual(
+            run(["git", "branch", "--show-current"], cwd=workspace / "service").stdout.strip(),
+            "feature/local-only",
+        )
+
+    def test_local_branch_does_not_require_remote_access(self) -> None:
+        source, _ = self.make_repository("offline")
+        run(["git", "remote", "set-url", "origin", str(self.root / "missing.git")], cwd=source)
+        workspace = self.root / "workspace"
+        spec = self.write_spec(
+            {
+                "workspace": str(workspace),
+                "name": "offline",
+                "branch": "feature/shared",
+                "primary": "offline",
+                "repositories": [{"name": "offline", "local_repo": str(source)}],
+            }
+        )
+
+        created, report = self.invoke("create", spec)
+        self.assertEqual(created.returncode, 0)
+        self.assertEqual(
+            report["repositories"][0]["mode"], "worktree-existing-local-branch"
+        )
+
+    def test_branch_already_checked_out_fails_without_force(self) -> None:
+        source, _ = self.make_repository("occupied")
+        run(["git", "switch", "feature/shared"], cwd=source)
+        workspace = self.root / "workspace"
+        spec = self.write_spec(
+            {
+                "workspace": str(workspace),
+                "name": "occupied",
+                "branch": "feature/shared",
+                "primary": "occupied",
+                "repositories": [{"name": "occupied", "local_repo": str(source)}],
+            }
+        )
+
+        completed, report = self.invoke("preflight", spec)
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("already checked out", report["errors"][0])
+        self.assertIn(str(source), report["errors"][0])
+        self.assertFalse(workspace.exists())
+
+    def test_failed_hydration_reports_registered_worktree(self) -> None:
+        source, _ = self.make_repository("stale", with_manifest=True)
+        workspace = self.root / "workspace"
+        spec_path = self.write_spec(
+            {
+                "workspace": str(workspace),
+                "name": "stale",
+                "branch": "feature/shared",
+                "primary": "stale",
+                "repositories": [{"name": "stale", "local_repo": str(source)}],
+            }
+        )
+        script = runpy.run_path(str(SCRIPT))
+        spec = script["load_spec"](spec_path)
+        preflight, plans = script["inspect_spec"](spec)
+        self.assertEqual(preflight["status"], "ok")
+        (source / ".env.local").unlink()
+
+        report = script["create_workspace"](spec, plans)
+        self.assertEqual(report["status"], "error")
+        self.assertIn("changed or disappeared", report["errors"][0])
+        self.assertEqual(len(report["linked_worktrees"]), 1)
+        self.assertEqual(report["linked_worktrees"][0]["backing_repo"], str(source.resolve()))
+        self.assertIn(".creating-", report["linked_worktrees"][0]["path"])
+        self.assertEqual(report["staging"], str(Path(report["linked_worktrees"][0]["path"]).parent))
 
     def test_creates_local_branch_from_confirmed_base(self) -> None:
         _, remote = self.make_repository("service")
@@ -231,6 +384,24 @@ class MultiRepoWorkspaceTest(unittest.TestCase):
                     {"name": "one", "directory": "apps", "url": str(remote)},
                     {"name": "two", "directory": "apps/two", "url": str(remote)},
                 ],
+            }
+        )
+
+        completed, report = self.invoke("preflight", spec)
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("must not overlap", report["errors"][0])
+        self.assertFalse(workspace.exists())
+
+    def test_workspace_cannot_be_nested_in_local_repository(self) -> None:
+        source, _ = self.make_repository("nested")
+        workspace = source / "generated" / "workspace"
+        spec = self.write_spec(
+            {
+                "workspace": str(workspace),
+                "name": "nested",
+                "branch": "feature/shared",
+                "primary": "nested",
+                "repositories": [{"name": "nested", "local_repo": str(source)}],
             }
         )
 

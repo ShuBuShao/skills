@@ -48,6 +48,19 @@ class HydrationPlan:
     missing: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class CheckoutPlan:
+    mode: str
+    start_point: str
+    fetch_branch: Optional[str]
+
+
+@dataclass(frozen=True)
+class RepositoryPlan:
+    checkout: CheckoutPlan
+    hydration: HydrationPlan
+
+
 def git(
     args: list[str], cwd: Optional[Path] = None, timeout: Optional[int] = None
 ) -> str:
@@ -73,6 +86,29 @@ def git(
         detail = completed.stderr.strip() or completed.stdout.strip() or "unknown git error"
         raise WorkspaceError(detail)
     return completed.stdout.strip()
+
+
+def git_succeeds(args: list[str], cwd: Optional[Path] = None) -> bool:
+    env = os.environ.copy()
+    env.setdefault("GIT_TERMINAL_PROMPT", "0")
+    try:
+        completed = subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            env=env,
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=15,
+            check=False,
+        )
+    except FileNotFoundError as error:
+        raise WorkspaceError("git is required but was not found") from error
+    except subprocess.TimeoutExpired as error:
+        raise WorkspaceError("git command timed out") from error
+    if completed.returncode not in (0, 1):
+        raise WorkspaceError(completed.stderr.strip() or "git reference check failed")
+    return completed.returncode == 0
 
 
 def require_string(value: Any, field: str) -> str:
@@ -191,10 +227,15 @@ def load_spec(path: Path) -> WorkspaceSpec:
             local_repo = git_root(local_path, f"{prefix}.local_repo")
 
         url_value = raw.get("url")
-        if url_value is None:
-            if local_repo is None:
-                raise WorkspaceError(f"{prefix} requires url or local_repo")
-            url_value = git(["remote", "get-url", "origin"], cwd=local_repo, timeout=15)
+        if local_repo is not None:
+            try:
+                url_value = git(["remote", "get-url", "origin"], cwd=local_repo, timeout=15)
+            except WorkspaceError as error:
+                raise WorkspaceError(
+                    f"{prefix}.local_repo requires an origin remote"
+                ) from error
+        elif url_value is None:
+            raise WorkspaceError(f"{prefix} requires url or local_repo")
         url = validate_url(url_value, f"{prefix}.url")
 
         repositories.append(
@@ -333,15 +374,97 @@ def remote_branch_exists(url: str, branch: str) -> bool:
     return bool(output)
 
 
+def local_branch_exists(repository: Repository, branch: str) -> bool:
+    if repository.local_repo is None:
+        return False
+    return git_succeeds(
+        ["show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+        cwd=repository.local_repo,
+    )
+
+
+def branch_worktree(repository: Repository, branch: str) -> Optional[Path]:
+    if repository.local_repo is None:
+        return None
+    output = git(["worktree", "list", "--porcelain"], cwd=repository.local_repo, timeout=15)
+    current_path: Optional[Path] = None
+    expected_ref = f"refs/heads/{branch}"
+    for line in [*output.splitlines(), ""]:
+        if line.startswith("worktree "):
+            current_path = Path(line.removeprefix("worktree "))
+        elif line == f"branch {expected_ref}":
+            return current_path
+        elif not line:
+            current_path = None
+    return None
+
+
+def checkout_plan(repository: Repository) -> CheckoutPlan:
+    if repository.local_repo is None:
+        if remote_branch_exists(repository.url, repository.branch):
+            return CheckoutPlan("clone-branch", repository.branch, None)
+        if repository.base_branch is None:
+            raise WorkspaceError(
+                f"remote branch {repository.branch!r} does not exist and base_branch is not set"
+            )
+        if not remote_branch_exists(repository.url, repository.base_branch):
+            raise WorkspaceError(
+                f"remote branch {repository.branch!r} and base branch "
+                f"{repository.base_branch!r} do not exist"
+            )
+        return CheckoutPlan(
+            "clone-base-create-local-branch", repository.base_branch, None
+        )
+
+    occupied_path = branch_worktree(repository, repository.branch)
+    if local_branch_exists(repository, repository.branch):
+        if occupied_path is not None:
+            raise WorkspaceError(
+                f"branch {repository.branch!r} is already checked out at {occupied_path}"
+            )
+        return CheckoutPlan(
+            "worktree-existing-local-branch", repository.branch, None
+        )
+
+    if remote_branch_exists(repository.url, repository.branch):
+        return CheckoutPlan(
+            "worktree-track-remote-branch",
+            f"origin/{repository.branch}",
+            repository.branch,
+        )
+
+    if repository.base_branch is None:
+        raise WorkspaceError(
+            f"branch {repository.branch!r} is unavailable locally and remotely, "
+            "and base_branch is not set"
+        )
+    if local_branch_exists(repository, repository.base_branch):
+        return CheckoutPlan(
+            "worktree-create-local-branch-from-local-base",
+            repository.base_branch,
+            None,
+        )
+    if remote_branch_exists(repository.url, repository.base_branch):
+        return CheckoutPlan(
+            "worktree-create-local-branch-from-remote-base",
+            f"origin/{repository.base_branch}",
+            repository.base_branch,
+        )
+    raise WorkspaceError(
+        f"branch {repository.branch!r} and base branch {repository.base_branch!r} "
+        "are unavailable locally and remotely"
+    )
+
+
 def summarized_paths(paths: Sequence[str], limit: int = 200) -> dict[str, Any]:
     values = list(paths)
     return {"count": len(values), "paths": values[:limit], "truncated": len(values) > limit}
 
 
-def inspect_spec(spec: WorkspaceSpec) -> tuple[dict[str, Any], dict[str, HydrationPlan]]:
+def inspect_spec(spec: WorkspaceSpec) -> tuple[dict[str, Any], dict[str, RepositoryPlan]]:
     errors: list[str] = []
     warnings: list[str] = []
-    plans: dict[str, HydrationPlan] = {}
+    plans: dict[str, RepositoryPlan] = {}
 
     if spec.workspace.exists():
         errors.append(f"workspace destination already exists: {spec.workspace}")
@@ -349,26 +472,20 @@ def inspect_spec(spec: WorkspaceSpec) -> tuple[dict[str, Any], dict[str, Hydrati
     repositories: list[dict[str, Any]] = []
     for repository in spec.repositories:
         try:
-            branch_exists = remote_branch_exists(repository.url, repository.branch)
-            mode = "clone-branch"
-            if not branch_exists:
-                if repository.base_branch is None:
-                    raise WorkspaceError(
-                        f"remote branch {repository.branch!r} does not exist and base_branch is not set"
-                    )
-                if not remote_branch_exists(repository.url, repository.base_branch):
-                    raise WorkspaceError(
-                        f"remote branch {repository.branch!r} and base branch "
-                        f"{repository.base_branch!r} do not exist"
-                    )
-                mode = "clone-base-create-local-branch"
-
-            plan = hydration_plan(repository)
-            plans[repository.name] = plan
-            for pattern in plan.missing:
+            if repository.local_repo is not None and (
+                is_within(spec.workspace, repository.local_repo)
+                or is_within(repository.local_repo, spec.workspace)
+            ):
+                raise WorkspaceError(
+                    "workspace destination and local repository must not overlap"
+                )
+            checkout = checkout_plan(repository)
+            hydration = hydration_plan(repository)
+            plans[repository.name] = RepositoryPlan(checkout, hydration)
+            for pattern in hydration.missing:
                 warnings.append(f"{repository.name}: no local match for {pattern!r}")
             relative_files = (
-                [path.relative_to(repository.local_repo).as_posix() for path in plan.files]
+                [path.relative_to(repository.local_repo).as_posix() for path in hydration.files]
                 if repository.local_repo
                 else []
             )
@@ -379,13 +496,13 @@ def inspect_spec(spec: WorkspaceSpec) -> tuple[dict[str, Any], dict[str, Hydrati
                     "directory": repository.directory,
                     "branch": repository.branch,
                     "base_branch": repository.base_branch,
-                    "mode": mode,
+                    "mode": checkout.mode,
                     "local_repo": str(repository.local_repo) if repository.local_repo else None,
                     "hydration": {
-                        "manifest": str(plan.manifest) if plan.manifest else None,
-                        "patterns": list(plan.patterns),
+                        "manifest": str(hydration.manifest) if hydration.manifest else None,
+                        "patterns": list(hydration.patterns),
                         "files": summarized_paths(relative_files),
-                        "missing": list(plan.missing),
+                        "missing": list(hydration.missing),
                     },
                 }
             )
@@ -440,63 +557,126 @@ def copy_hydration(repository: Repository, plan: HydrationPlan, target: Path) ->
     }
 
 
-def create_workspace(spec: WorkspaceSpec, plans: dict[str, HydrationPlan]) -> dict[str, Any]:
+def fetch_remote_branch(repository: Repository, branch: str) -> None:
+    if repository.local_repo is None:
+        raise WorkspaceError(f"{repository.name}: local repository is required for fetch")
+    git(
+        [
+            "fetch",
+            "--no-tags",
+            "origin",
+            f"+refs/heads/{branch}:refs/remotes/origin/{branch}",
+        ],
+        cwd=repository.local_repo,
+    )
+
+
+def create_checkout(repository: Repository, plan: CheckoutPlan, target: Path) -> str:
+    if repository.local_repo is None:
+        if plan.mode == "clone-branch":
+            git(
+                [
+                    "clone",
+                    "--branch",
+                    repository.branch,
+                    "--single-branch",
+                    "--",
+                    repository.url,
+                    str(target),
+                ]
+            )
+        else:
+            git(
+                [
+                    "clone",
+                    "--branch",
+                    plan.start_point,
+                    "--single-branch",
+                    "--",
+                    repository.url,
+                    str(target),
+                ]
+            )
+            git(["switch", "-c", repository.branch], cwd=target)
+        return plan.mode
+
+    if plan.fetch_branch is not None:
+        fetch_remote_branch(repository, plan.fetch_branch)
+    if plan.mode == "worktree-existing-local-branch":
+        git(
+            ["worktree", "add", "--", str(target), repository.branch],
+            cwd=repository.local_repo,
+        )
+    elif plan.mode == "worktree-track-remote-branch":
+        git(
+            [
+                "worktree",
+                "add",
+                "--track",
+                "-b",
+                repository.branch,
+                "--",
+                str(target),
+                plan.start_point,
+            ],
+            cwd=repository.local_repo,
+        )
+    else:
+        git(
+            [
+                "worktree",
+                "add",
+                "-b",
+                repository.branch,
+                "--",
+                str(target),
+                plan.start_point,
+            ],
+            cwd=repository.local_repo,
+        )
+    return plan.mode
+
+
+def create_workspace(spec: WorkspaceSpec, plans: dict[str, RepositoryPlan]) -> dict[str, Any]:
     parent = spec.workspace.parent
     parent.mkdir(parents=True, exist_ok=True)
     if spec.workspace.exists():
         raise WorkspaceError(f"workspace destination already exists: {spec.workspace}")
     staging = Path(tempfile.mkdtemp(prefix=f".{spec.workspace.name}.creating-", dir=parent))
     results: list[dict[str, Any]] = []
+    linked_worktrees: list[dict[str, str]] = []
+    workspace_moved = False
 
     try:
         for repository in spec.repositories:
             target = staging / repository.directory
             target.parent.mkdir(parents=True, exist_ok=True)
-            branch_exists = remote_branch_exists(repository.url, repository.branch)
-            if branch_exists:
-                git(
-                    [
-                        "clone",
-                        "--branch",
-                        repository.branch,
-                        "--single-branch",
-                        "--",
-                        repository.url,
-                        str(target),
-                    ]
+            repository_plan = plans[repository.name]
+            mode = create_checkout(repository, repository_plan.checkout, target)
+            if repository.local_repo is not None:
+                linked_worktrees.append(
+                    {
+                        "name": repository.name,
+                        "backing_repo": str(repository.local_repo),
+                        "path": str(target),
+                    }
                 )
-                mode = "clone-branch"
-            else:
-                if repository.base_branch is None:
-                    raise WorkspaceError(
-                        f"{repository.name}: branch disappeared and base_branch is not set"
-                    )
-                git(
-                    [
-                        "clone",
-                        "--branch",
-                        repository.base_branch,
-                        "--single-branch",
-                        "--",
-                        repository.url,
-                        str(target),
-                    ]
-                )
-                git(["switch", "-c", repository.branch], cwd=target)
-                mode = "clone-base-create-local-branch"
 
             current_branch = git(["branch", "--show-current"], cwd=target, timeout=15)
             if current_branch != repository.branch:
                 raise WorkspaceError(
                     f"{repository.name}: expected branch {repository.branch!r}, got {current_branch!r}"
                 )
-            hydration = copy_hydration(repository, plans[repository.name], target)
+            hydration = copy_hydration(repository, repository_plan.hydration, target)
             results.append(
                 {
                     "name": repository.name,
                     "directory": repository.directory,
                     "branch": current_branch,
                     "mode": mode,
+                    "backing_repo": (
+                        str(repository.local_repo) if repository.local_repo else None
+                    ),
                     "hydration": hydration,
                 }
             )
@@ -519,12 +699,37 @@ def create_workspace(spec: WorkspaceSpec, plans: dict[str, HydrationPlan]) -> di
         if spec.workspace.exists():
             raise WorkspaceError(f"workspace destination appeared during creation: {spec.workspace}")
         staging.rename(spec.workspace)
+        workspace_moved = True
+        for linked_worktree in linked_worktrees:
+            linked_worktree["path"] = str(
+                spec.workspace
+                / next(
+                    repository.directory
+                    for repository in spec.repositories
+                    if repository.name == linked_worktree["name"]
+                )
+            )
+        for repository in spec.repositories:
+            if repository.local_repo is None:
+                continue
+            final_target = spec.workspace / repository.directory
+            git(
+                ["worktree", "repair", str(final_target)],
+                cwd=repository.local_repo,
+                timeout=30,
+            )
+            actual_root = git(["rev-parse", "--show-toplevel"], cwd=final_target, timeout=15)
+            if Path(actual_root).resolve() != final_target.resolve():
+                raise WorkspaceError(
+                    f"{repository.name}: repaired worktree resolves to {actual_root}"
+                )
         return {
             "status": "ok",
             "workspace": str(spec.workspace),
             "workspace_file": str(spec.workspace / staging_workspace.name),
             "primary": spec.primary,
             "repositories": results,
+            "linked_worktrees": linked_worktrees,
             "warnings": [],
             "errors": [],
         }
@@ -533,8 +738,10 @@ def create_workspace(spec: WorkspaceSpec, plans: dict[str, HydrationPlan]) -> di
         return {
             "status": "error",
             "workspace": str(spec.workspace),
-            "staging": str(staging),
+            "staging": None if workspace_moved else str(staging),
+            "partial_workspace": str(spec.workspace) if workspace_moved else None,
             "repositories": results,
+            "linked_worktrees": linked_worktrees,
             "warnings": [],
             "errors": [message],
         }
@@ -546,7 +753,7 @@ def emit(report: dict[str, Any]) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Create an independent-clone multi-repository workspace"
+        description="Create a worktree-first multi-repository workspace"
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     for command in ("preflight", "create"):
