@@ -184,6 +184,13 @@ class MultiRepoWorkspaceTest(unittest.TestCase):
             [folder["name"] for folder in workspace_data["folders"]],
             ["frontend", "backend"],
         )
+        claude_instructions = (workspace / "CLAUDE.md").read_text(encoding="utf-8")
+        self.assertIn("当前目录是多仓库协调工作区，不是 Git 仓库", claude_instructions)
+        self.assertIn("`.code-workspace` 文件中的 folders", claude_instructions)
+        self.assertIn("第一项是默认主项目", claude_instructions)
+        self.assertIn("分别报告每个仓库", claude_instructions)
+        self.assertNotIn("frontend", claude_instructions)
+        self.assertNotIn("backend", claude_instructions)
 
     def test_fetches_remote_branch_into_local_repository_for_worktree(self) -> None:
         source, _ = self.make_repository("service")

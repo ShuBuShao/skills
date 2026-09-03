@@ -637,6 +637,23 @@ def create_checkout(repository: Repository, plan: CheckoutPlan, target: Path) ->
     return plan.mode
 
 
+def claude_workspace_instructions() -> str:
+    return """# 多仓库工作区说明
+
+当前目录是多仓库协调工作区，不是 Git 仓库。项目范围以同目录 `.code-workspace` 文件中的 folders 为准，第一项是默认主项目；各项目目录分别是独立 Git 仓库。
+
+## 工作约定
+
+- 默认使用中文沟通。
+- 开始任务前先确认主项目和受影响项目，只修改任务范围内的项目。
+- 进入项目工作时，先读取并遵守该项目适用的 `CLAUDE.md` 和相关规则。
+- 相同分支名只是跨仓库协作惯例；执行 Git 操作前必须分别确认每个仓库的实际分支和工作区状态。
+- 提交、推送、变基、合并和状态检查必须逐仓库执行，不要把外层目录当成 Git 仓库。
+- 不要输出或提交 `.env`、`.env.local` 等本地配置和凭据。
+- 跨仓库任务完成后，分别报告每个仓库的改动、验证结果和 Git 状态。
+"""
+
+
 def create_workspace(spec: WorkspaceSpec, plans: dict[str, RepositoryPlan]) -> dict[str, Any]:
     parent = spec.workspace.parent
     parent.mkdir(parents=True, exist_ok=True)
@@ -694,6 +711,10 @@ def create_workspace(spec: WorkspaceSpec, plans: dict[str, RepositoryPlan]) -> d
         staging_workspace = staging / f"{spec.name}.code-workspace"
         staging_workspace.write_text(
             json.dumps(workspace_data, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        (staging / "CLAUDE.md").write_text(
+            claude_workspace_instructions(),
             encoding="utf-8",
         )
         if spec.workspace.exists():

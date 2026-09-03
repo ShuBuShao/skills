@@ -1,4 +1,4 @@
 interface:
   display_name: "Multi-Repo Workspace"
-  short_description: "Create a worktree-first multi-repo workspace"
+  short_description: "Create a worktree-first VS Code and Claude workspace"
   default_prompt: "Use $multi-repo-workspace to create a coordinated multi-repository workspace."
