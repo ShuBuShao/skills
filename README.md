@@ -22,6 +22,17 @@ npx skills add ShuBuShao/skills --skill multi-repo-workspace
 npx skills add ShuBuShao/skills --skill multi-repo-workspace --global
 ```
 
+## 可用技能
+
+- `multi-repo-workspace`：创建协调多个仓库的开发工作区。
+- `migration-bug-guide`：按当前模块、新旧实现和项目规范，生成或更新业务目录的翻新缺陷修复指引。
+
+安装翻新缺陷修复指引技能：
+
+```bash
+npx skills add ShuBuShao/skills --skill migration-bug-guide
+```
+
 ## 仓库结构
 
 ```text

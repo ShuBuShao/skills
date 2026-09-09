@@ -1,0 +1,4 @@
+interface:
+  display_name: "翻新缺陷修复指引"
+  short_description: "根据当前模块和新旧源码生成或更新有明确作用范围的翻新缺陷修复指引"
+  default_prompt: "使用 $migration-bug-guide，根据当前工作区的新旧实现，为指定业务模块生成缺陷修复指引。"
