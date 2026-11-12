@@ -26,6 +26,7 @@ npx skills add ShuBuShao/skills --skill multi-repo-workspace --global
 
 - `multi-repo-workspace`：创建协调多个仓库的开发工作区。
 - `migration-bug-guide`：按当前模块、新旧实现和项目规范，生成或更新业务目录的翻新缺陷修复指引。
+- `visual-design-fidelity`：按设计标注建立视觉基线，并用浏览器实测和截图验证还原度。
 
 安装翻新缺陷修复指引技能：
 
