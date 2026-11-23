@@ -1,0 +1,8 @@
+{
+  "name": "ShuBuShao-skills",
+  "skills": [
+    "./skills/migration-bug-guide",
+    "./skills/multi-repo-workspace",
+    "./skills/visual-design-fidelity"
+  ]
+}
