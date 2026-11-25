@@ -1,6 +1,6 @@
 ---
 name: multi-repo-workspace
-description: Create a coordinated VS Code and Claude Code multi-repository workspace by using Git worktrees from user-selected local repositories first, cloning repositories without a local checkout, optionally copying local files declared by .worktreeinclude, and generating Chinese workspace-level Claude instructions. Use when the user asks to create, rebuild, or automate a multi-repository development workspace. Do not use for an ordinary single-repository clone or standalone worktree maintenance.
+description: Create or rebuild coordinated VS Code and Claude Code multi-repository workspaces using Git worktrees. Use also to check, switch, or synchronize branches across repositories in an existing multi-repository workspace.
 ---
 
 # Multi-Repo Workspace
@@ -13,7 +13,15 @@ Use the bundled `scripts/create_workspace.py` for preflight and creation. Do not
 
 The script requires Git and Python 3.9 or newer. It uses only the Python standard library.
 
-## Required input
+## Existing workspace branch checks and synchronization
+
+1. Read `folders` from the existing `.code-workspace` and resolve repository paths relative to that file. Limit the checks to the repositories named by the user, or use the workspace inventory when the entire workspace is in scope.
+2. For each repository, run `git --no-optional-locks status --porcelain=v2 --branch` and use `git worktree list --porcelain` to check target branch occupancy. Use `branch.ab` for ahead/behind relative to the configured upstream. A `branch.upstream` without `branch.ab` means the configured upstream is unavailable locally. Report an unconfigured upstream separately. For a requested baseline, resolve its ref first, then run `git rev-list --left-right --count HEAD...<resolved-ref>`. Keep upstream and baseline counts separate and label comparisons based on existing local refs. For a check that needs live remote tips, use `git ls-remote` and count against those tips only when their commits are available locally.
+3. For an authorized current-branch sync, stop the affected update if the worktree has uncommitted changes, a Git operation is in progress, HEAD is detached, or the branch has no configured upstream. Otherwise, fetch the exact configured upstream branch from its remote. Stop if that branch cannot be fetched or has diverged. Recheck the branch and worktree, then use the freshly verified upstream commit for `git merge --ff-only`.
+4. Apply branch switches, branch creation from a named base, baseline merges, and pushes only within the current request's scope. Check whether another worktree owns the target branch before switching. Preserve uncommitted work and report any blockage or conflict. Use the user's approved scope to decide whether independent repositories can continue.
+5. Return one row per repository, including blocked or skipped ones. Report branch and worktree state, target branch occupancy when applicable, upstream and baseline counts with their evidence, and the action taken or blockage. After an authorized update, recheck the branch, HEAD, and worktree state and report the resulting counts.
+
+## Creation input
 
 Collect these values without asking the user to repeat anything already supplied:
 
@@ -54,7 +62,7 @@ Create a temporary JSON file outside repositories and the requested workspace. U
 
 If the requested branch already exists locally, worktree mode uses it without contacting the remote. If it exists only on `origin`, the script fetches that branch and creates a tracking branch. `base_branch` is required when the requested branch exists neither locally nor remotely; the script creates the requested branch from the local base when available, otherwise from the fetched remote base. Clone mode follows the equivalent remote-branch and confirmed-base behavior. The script never pushes or creates a remote branch.
 
-## Workflow
+## Creation workflow
 
 1. Run `python3 scripts/create_workspace.py preflight --spec <temporary-spec>` from this Skill directory.
 2. Read the JSON report. Resolve every error before continuing. Missing include entries are warnings, not errors.
