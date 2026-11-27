@@ -40,3 +40,23 @@ Backslash escapes and negated patterns are not supported. Use forward slashes on
 - A pattern with no matches is a warning and does not stop creation.
 - Copy file metadata where the platform permits it.
 - Reports contain path names and counts only, never file contents.
+
+## Initialize a missing `.env.local`
+
+After Git checkout and local file hydration, retain any existing `.env.local` path. If the path is absent, initialize it when all of these conditions hold.
+
+- The target repository tracks a root `.worktreeinclude` containing a line with exactly `.env.local` after trimming whitespace.
+- The target repository tracks a root `.env.example`. Both tracked files are ordinary files.
+- Git ignores the target `.env.local` path.
+
+Create the file exclusively and copy the template bytes as-is. This step applies to worktrees and clones. Projects that declare only `.env` obtain that file through local file hydration when available.
+
+Preflight reports matches and missing patterns from the source checkout. The create report records the template initialization outcome in each repository's `env_local` field.
+
+| Status | Outcome |
+| --- | --- |
+| `created` | Copied `.env.example` to `.env.local`. |
+| `existing` | Kept the existing `.env.local` path. |
+| `not_enabled` | The target lacks a tracked, ordinary manifest declaring `.env.local`. |
+| `missing_template` | The target lacks a tracked, ordinary `.env.example`. |
+| `not_ignored` | Git does not ignore the target `.env.local` path. |

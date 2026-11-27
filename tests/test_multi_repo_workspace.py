@@ -47,7 +47,12 @@ class MultiRepoWorkspaceTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def make_repository(self, name: str, with_manifest: bool = False) -> tuple[Path, Path]:
+    def make_repository(
+        self,
+        name: str,
+        with_manifest: bool = False,
+        tracked_files: Optional[dict[str, str]] = None,
+    ) -> tuple[Path, Path]:
         checkout = self.root / f"{name}-source"
         remote = self.root / f"{name}.git"
         checkout.mkdir()
@@ -60,6 +65,8 @@ class MultiRepoWorkspaceTest(unittest.TestCase):
                 ".env.local\n.local-tools/example-*/\ntracked.txt\nmissing.local\n",
                 encoding="utf-8",
             )
+        for path, content in (tracked_files or {}).items():
+            (checkout / path).write_bytes(content.encode("utf-8"))
         run(["git", "add", "."], cwd=checkout)
         run(["git", "commit", "-m", "initial"], cwd=checkout)
         run(["git", "switch", "-c", "feature/shared"], cwd=checkout)
@@ -91,7 +98,14 @@ class MultiRepoWorkspaceTest(unittest.TestCase):
         return completed, json.loads(completed.stdout)
 
     def test_creates_multi_repo_workspace_and_hydrates_local_files(self) -> None:
-        frontend_source, frontend_remote = self.make_repository("frontend", with_manifest=True)
+        frontend_source, frontend_remote = self.make_repository(
+            "frontend",
+            with_manifest=True,
+            tracked_files={
+                ".gitignore": ".env.local\n",
+                ".env.example": "TEMPLATE_ONLY=yes\n",
+            },
+        )
         _, backend_remote = self.make_repository("backend")
         workspace = self.root / "workspace"
         spec = self.write_spec(
@@ -156,6 +170,9 @@ class MultiRepoWorkspaceTest(unittest.TestCase):
         )
         self.assertEqual(frontend_result["mode"], "worktree-existing-local-branch")
         self.assertEqual(
+            frontend_result["env_local"], {"path": ".env.local", "status": "existing"}
+        )
+        self.assertEqual(
             created_report["linked_worktrees"],
             [
                 {
@@ -171,6 +188,9 @@ class MultiRepoWorkspaceTest(unittest.TestCase):
             if repository["name"] == "backend"
         )
         self.assertEqual(backend_result["mode"], "clone-branch")
+        self.assertEqual(
+            backend_result["env_local"], {"path": ".env.local", "status": "not_enabled"}
+        )
         self.assertIn("tracked.txt", frontend_result["hydration"]["skipped"]["paths"])
         worktree_list = run(
             ["git", "worktree", "list", "--porcelain"], cwd=frontend_source
@@ -191,6 +211,128 @@ class MultiRepoWorkspaceTest(unittest.TestCase):
         self.assertIn("分别报告每个仓库", claude_instructions)
         self.assertNotIn("frontend", claude_instructions)
         self.assertNotIn("backend", claude_instructions)
+
+    def test_initializes_env_local_from_target_template_for_worktree_and_clone(self) -> None:
+        template = "TEMPLATE_ONLY=yes\r\n"
+        source, remote = self.make_repository(
+            "frontend",
+            tracked_files={
+                ".worktreeinclude": ".env.local\n",
+                ".gitignore": ".env.local\n",
+                ".gitattributes": "/.env.example -text\n",
+                ".env.example": template,
+            },
+        )
+        (source / ".worktreeinclude").write_text("# unrelated checkout\n", encoding="utf-8")
+        (source / ".env.example").write_text("SOURCE_ONLY=yes\n", encoding="utf-8")
+        workspace = self.root / "workspace"
+        spec = self.write_spec(
+            {
+                "workspace": str(workspace),
+                "name": "env-fallback",
+                "branch": "feature/shared",
+                "primary": "worktree",
+                "repositories": [
+                    {"name": "worktree", "local_repo": str(source)},
+                    {"name": "clone", "url": str(remote)},
+                ],
+            }
+        )
+
+        created, report = self.invoke("create", spec)
+        self.assertEqual(created.returncode, 0, created.stdout)
+        self.assertEqual(report["status"], "ok")
+        self.assertNotIn("TEMPLATE_ONLY", created.stdout)
+        self.assertNotIn("SOURCE_ONLY", created.stdout)
+        for name, mode in (
+            ("worktree", "worktree-existing-local-branch"),
+            ("clone", "clone-branch"),
+        ):
+            with self.subTest(name=name):
+                repository = next(item for item in report["repositories"] if item["name"] == name)
+                self.assertEqual(repository["mode"], mode)
+                self.assertEqual(
+                    repository["env_local"], {"path": ".env.local", "status": "created"}
+                )
+                target = workspace / name
+                self.assertEqual((target / ".env.local").read_bytes(), template.encode())
+                self.assertEqual(run(["git", "status", "--short"], cwd=target).stdout, "")
+        self.assertFalse((source / ".env.local").exists())
+
+    def test_preserves_tracked_env_local_and_skips_unavailable_fallbacks(self) -> None:
+        cases = {
+            "existing": {
+                ".worktreeinclude": ".env.local\n",
+                ".gitignore": "!.env.local\n",
+                ".env.example": "TEMPLATE_ONLY=yes\n",
+                ".env.local": "TRACKED_ONLY=yes\n",
+            },
+            "missing_template": {
+                ".worktreeinclude": ".env.local\n",
+                ".gitignore": ".env.local\n",
+            },
+            "not_ignored": {
+                ".worktreeinclude": ".env.local\n",
+                ".gitignore": "!.env.local\n",
+                ".env.example": "TEMPLATE_ONLY=yes\n",
+            },
+        }
+        for status, tracked_files in cases.items():
+            with self.subTest(status=status):
+                name = status.replace("_", "-")
+                _, remote = self.make_repository(name, tracked_files=tracked_files)
+                workspace = self.root / f"{name}-workspace"
+                spec = self.write_spec(
+                    {
+                        "workspace": str(workspace),
+                        "name": name,
+                        "branch": "feature/shared",
+                        "primary": name,
+                        "repositories": [{"name": name, "url": str(remote)}],
+                    }
+                )
+
+                created, report = self.invoke("create", spec)
+                self.assertEqual(created.returncode, 0, created.stdout)
+                self.assertEqual(
+                    report["repositories"][0]["env_local"], {"path": ".env.local", "status": status}
+                )
+                env_local = workspace / name / ".env.local"
+                if status == "existing":
+                    self.assertEqual(env_local.read_text(encoding="utf-8"), "TRACKED_ONLY=yes\n")
+                else:
+                    self.assertFalse(env_local.exists())
+
+    def test_keeps_native_env_hydration_without_initializing_env_local(self) -> None:
+        source, _ = self.make_repository(
+            "native",
+            tracked_files={
+                ".worktreeinclude": ".env\n",
+                ".gitignore": ".env\n.env.local\n",
+                ".env.example": "TEMPLATE_ONLY=yes\n",
+            },
+        )
+        (source / ".env").write_text("NATIVE_ONLY=yes\n", encoding="utf-8")
+        workspace = self.root / "workspace"
+        spec = self.write_spec(
+            {
+                "workspace": str(workspace),
+                "name": "native",
+                "branch": "feature/shared",
+                "primary": "native",
+                "repositories": [{"name": "native", "local_repo": str(source)}],
+            }
+        )
+
+        created, report = self.invoke("create", spec)
+        self.assertEqual(created.returncode, 0, created.stdout)
+        self.assertEqual(
+            report["repositories"][0]["env_local"], {"path": ".env.local", "status": "not_enabled"}
+        )
+        target = workspace / "native"
+        self.assertEqual((target / ".env").read_text(encoding="utf-8"), "NATIVE_ONLY=yes\n")
+        self.assertFalse((target / ".env.local").exists())
+        self.assertNotIn("NATIVE_ONLY", created.stdout)
 
     def test_fetches_remote_branch_into_local_repository_for_worktree(self) -> None:
         source, _ = self.make_repository("service")

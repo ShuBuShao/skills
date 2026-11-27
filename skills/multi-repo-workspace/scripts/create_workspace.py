@@ -557,6 +557,38 @@ def copy_hydration(repository: Repository, plan: HydrationPlan, target: Path) ->
     }
 
 
+def initialize_env_local(target: Path) -> str:
+    destination = target / ".env.local"
+    if destination.exists() or destination.is_symlink():
+        return "existing"
+
+    manifest = target / ".worktreeinclude"
+    template = target / ".env.example"
+    if manifest.is_symlink() or not manifest.is_file():
+        return "not_enabled"
+
+    tracked = set(
+        git(["ls-tree", "--name-only", "HEAD", "--", manifest.name, template.name], cwd=target).splitlines()
+    )
+    if manifest.name not in tracked or not any(
+        line.strip() == destination.name for line in manifest.read_text(encoding="utf-8").splitlines()
+    ):
+        return "not_enabled"
+
+    if template.name not in tracked or template.is_symlink() or not template.is_file():
+        return "missing_template"
+
+    if not git_succeeds(["check-ignore", "--quiet", "--", destination.name], cwd=target):
+        return "not_ignored"
+
+    try:
+        with template.open("rb") as source, destination.open("xb") as output:
+            shutil.copyfileobj(source, output)
+    except FileExistsError:
+        return "existing"
+    return "created"
+
+
 def fetch_remote_branch(repository: Repository, branch: str) -> None:
     if repository.local_repo is None:
         raise WorkspaceError(f"{repository.name}: local repository is required for fetch")
@@ -685,6 +717,7 @@ def create_workspace(spec: WorkspaceSpec, plans: dict[str, RepositoryPlan]) -> d
                     f"{repository.name}: expected branch {repository.branch!r}, got {current_branch!r}"
                 )
             hydration = copy_hydration(repository, repository_plan.hydration, target)
+            env_local_status = initialize_env_local(target)
             results.append(
                 {
                     "name": repository.name,
@@ -695,6 +728,7 @@ def create_workspace(spec: WorkspaceSpec, plans: dict[str, RepositoryPlan]) -> d
                         str(repository.local_repo) if repository.local_repo else None
                     ),
                     "hydration": hydration,
+                    "env_local": {"path": ".env.local", "status": env_local_status},
                 }
             )
 

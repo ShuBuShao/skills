@@ -69,18 +69,20 @@ If the requested branch already exists locally, worktree mode uses it without co
 3. Show one concise confirmation containing the destination, primary repository, per-repository worktree-or-clone mode, backing local repository or remote URL, branch behavior, and hydration patterns/counts. Never display copied file contents.
 4. After confirmation, run `python3 scripts/create_workspace.py create --spec <temporary-spec>`.
 5. Verify the final JSON report says `ok`, every repository reports the requested branch, and both the `.code-workspace` file and the Chinese wrapper-level `CLAUDE.md` exist.
-6. Report copied, skipped, and missing paths by name only. Offer to open the workspace only when the user asks.
+6. Report copied, initialized, skipped, and missing paths by name only. Offer to open the workspace only when the user asks.
 7. Tell the user they can enter the wrapper directory and run `claude`; do not add `--add-dir` arguments for repositories inside that wrapper.
 
 If the destination already exists, a requested branch is already checked out in another worktree, the requested and confirmed base branches are unavailable, or a manifest contains an unsafe path, stop without creating the final workspace. Never bypass branch occupancy with `--force`.
 
 Worktrees depend on the supplied local repository's common Git directory. Do not move or delete that backing repository while the generated workspace is in use. The script repairs Git's recorded worktree paths after moving the completed wrapper out of staging.
 
-## Local file hydration
+## Local configuration
 
-Hydration runs only when `local_repo` is provided and that selected checkout contains `.worktreeinclude`. It applies to the generated worktree after checkout. Read [references/worktreeinclude.md](references/worktreeinclude.md) whenever hydration is active.
+Local file hydration runs after checkout when the selected `local_repo` contains `.worktreeinclude`.
 
 The manifest in the local checkout is authoritative. Never use a remote branch's manifest to decide which local files to copy. Do not copy all ignored or untracked files as a fallback.
+
+After hydration, the script can initialize a missing `.env.local` from the target repository's template in both worktree and clone mode. Read [references/worktreeinclude.md](references/worktreeinclude.md) for eligibility and reporting before creating a workspace.
 
 ## Boundaries
 
